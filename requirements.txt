@@ -1,0 +1,15 @@
+Flask
+flask-cors
+psycopg2-binary
+requests
+geopandas
+fiona
+shapely
+matplotlib
+Werkzeug
+rasterio
+scipy
+rasterstats
+osmnx
+ee
+geemap

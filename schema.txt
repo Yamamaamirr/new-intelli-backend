@@ -1,0 +1,63 @@
+Heres the database schema i have:
+CREATE EXTENSION IF NOT EXISTS postgis;
+
+
+CREATE TABLE projects (
+    id UUID PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    current_version_id UUID,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+
+CREATE TABLE versions (
+    id UUID PRIMARY KEY,
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    version_number TEXT NOT NULL,
+    commit_message TEXT,
+    parent_version_id UUID REFERENCES versions(id) ON DELETE SET NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+
+ALTER TABLE projects
+ADD CONSTRAINT fk_current_version
+FOREIGN KEY (current_version_id) REFERENCES versions(id) ON DELETE SET NULL;
+
+
+CREATE TABLE vector_data (
+    id UUID PRIMARY KEY,
+    version_id UUID NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+    file_format TEXT,
+    geometry GEOMETRY,
+    crs TEXT DEFAULT 'EPSG:4326',
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+
+
+CREATE INDEX vector_data_geometry_gist
+ON vector_data
+USING GIST (geometry);
+
+
+
+CREATE TABLE raster_data (
+    id UUID PRIMARY KEY,
+    version_id UUID NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+    wms_url TEXT NOT NULL,
+    file_format TEXT,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+
+CREATE TABLE versioning_history (
+    id UUID PRIMARY KEY,
+    version_id UUID NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+    commit_message TEXT,
+    data_type TEXT CHECK (data_type IN ('vector', 'raster')),
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+
