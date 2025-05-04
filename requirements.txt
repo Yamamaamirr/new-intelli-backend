@@ -13,3 +13,4 @@ rasterstats
 osmnx
 ee
 geemap
+geoserver-rest
