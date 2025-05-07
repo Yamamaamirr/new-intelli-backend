@@ -1,3 +1,7 @@
 geogit/
 # Ignore virtual environment
 geogig/
+cache/
+outputs/
+raster_uploads/
+uploads/
