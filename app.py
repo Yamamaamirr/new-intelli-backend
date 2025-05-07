@@ -686,7 +686,94 @@ def voronoi():
                 logger.error(f"Error during LULC processing: {str(e)}")
                 logger.error(traceback.format_exc())
                 return jsonify({"error": str(e)}), 500
+        
+        elif full_response and "Keyword: UHI" in full_response:
+            logger.debug('Processing UHI request')
+            try:
+                # Extract dates from the response
+                start_match = re.search(r"Start_date:\s*(\d{4})", full_response)
+                end_match = re.search(r"End_date:\s*(\d{4})", full_response)
+                start_date = start_match.group(1) if start_match else None
+                end_date = end_match.group(1) if end_match else None
+                
+                if not (start_date and end_date):
+                    return jsonify({"error": "Start or end date missing in UHI response"}), 400
+                
+                # Convert to integers (just the year)
+                start_date = int(start_date[:4])
+                end_date = int(end_date[:4])
 
+                # Determine input file (geojson or shapefile)
+                uhi_input = None
+                for _, actual_path in uploaded_files.items():
+                    if actual_path.lower().endswith(('.geojson', '.shp')):
+                        uhi_input = actual_path
+                        break
+                
+                if not uhi_input:
+                    return jsonify({"error": "GeoJSON or Shapefile required for UHI analysis"}), 400
+                
+                # Generate UHI result
+                result = calculate_lst_uhi_stats(uhi_input, start_date, end_date)
+
+                # Export the result
+                output_filename = f"uhi_{start_date}_{end_date}.tif"
+                output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename).replace("\\", "/")
+                
+                geemap.ee_export_image(
+                    result["heatmap"],
+                    filename=output_path,
+                    region=result["aoi"].geometry(),
+                    scale=30,
+                    crs="EPSG:4326",
+                    file_per_band=False
+                )
+
+                # Upload the generated raster file
+                with open(output_path, 'rb') as f:
+                    files = {'file': (os.path.basename(output_path), f)}
+                    upload_response = requests.post(
+                        f"{request.host_url}api/projects/{project_id}/upload/raster",
+                        files=files
+                    )
+                
+                if upload_response.status_code != 201:
+                    logger.error(f"Failed to upload UHI raster data: {upload_response.text}")
+                    return jsonify({"error": "Failed to upload UHI raster data"}), 500
+                
+                upload_data = upload_response.json()
+
+                
+
+                # added this to sultan code to fix df eror (didnt worked) 
+                # stats_data = result["df"]
+                # if hasattr(stats_data, 'to_dict'):
+                #  stats_data = stats_data.to_dict(orient='records')
+                # elif isinstance(stats_data, list):
+                #  pass
+                # else:
+                #  stats_data = str(stats_data)   
+                 
+                  
+                return jsonify({
+                    "id": upload_data.get('version_id'),
+                    "name": os.path.basename(output_path),
+                    "type": "raster",
+                    "format": "tif",
+                    "crs": "EPSG:4326",
+                    "status": "new",
+                    "version_number": upload_data.get('version_number'),
+                    "mapbox_url": upload_data.get('mapbox_url'),
+                    "bounding_box": upload_data.get('bounding_box'),
+                    "file_path": upload_data.get('file_path'),
+                    # Additional UHI-specific data
+                    # "stats_data": result["df"].to_dict(orient='records') #temp removed this
+                }), 200
+
+            except Exception as e:
+                logger.error(f"Error during UHI processing: {str(e)}")
+                logger.error(traceback.format_exc())
+                return jsonify({"error": str(e)}), 500
 
 
         logger.info(f"Generated code: {code}")
@@ -820,8 +907,6 @@ def voronoi():
 def generate_lulc_from_geojson(geojson_path: str, start_date: str, end_date: str):
     import ee, geemap
 
-    ee.Authenticate()
-    ee.Initialize()
 
     gdf = gpd.read_file(geojson_path)
     geojson = gdf.__geo_interface__
@@ -868,6 +953,132 @@ def generate_lulc_from_geojson(geojson_path: str, start_date: str, end_date: str
     return {
         "label_percentages": label_percentages,
         "dw_rgb": dw_rgb,
+        "aoi": aoi  # You will need this for export
+    }
+
+
+def calculate_lst_uhi_stats(geojson_path, start_year, end_year, scale=30):
+    
+   
+
+    # Load GeoJSON and convert to EE object
+    gdf = gpd.read_file(geojson_path)
+    geojson = gdf.__geo_interface__
+    aoi = geemap.geojson_to_ee(geojson)
+
+    # Preprocess Landsat
+    def preprocess_landsat(img):
+        thermal = img.select("ST_B10").multiply(0.00341802).add(149.0).subtract(273.15).rename("LST_Celsius")
+        cloud_mask = (
+            img.select("QA_PIXEL").bitwiseAnd(1 << 3)
+            .Or(img.select("QA_PIXEL").bitwiseAnd(1 << 1))
+            .Or(img.select("QA_PIXEL").bitwiseAnd(1 << 4))
+            .eq(0)
+        )
+        return thermal.updateMask(cloud_mask).copyProperties(img, ["system:time_start"])
+
+    def get_urban_masks(geometry, year):
+        dw = (
+            ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1")
+            .filterBounds(geometry)
+            .filterDate(f"{end_year}-01-01", f"{end_year}-12-31")
+            .select("label")
+            .mode()
+            .clip(geometry)
+        )
+        urban = dw.eq(6)
+        nonurban = dw.neq(6)
+        return urban, nonurban
+
+    def compute_lst_stats(year):
+        start = ee.Date.fromYMD(year, 6, 1)
+        end = ee.Date.fromYMD(year, 8, 31)
+
+        coll = (
+            ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+            .merge(ee.ImageCollection("LANDSAT/LC09/C02/T1_L2"))
+            .filterBounds(aoi)
+            .filterDate(start, end)
+            .map(lambda img: preprocess_landsat(img.clip(aoi)))
+        )
+
+        image = coll.reduce(ee.Reducer.mean()).rename("LST_Celsius")
+
+        stats = image.reduceRegion(
+            reducer=ee.Reducer.mean().combine(ee.Reducer.median(), "", True)
+                                  .combine(ee.Reducer.min(), "", True)
+                                  .combine(ee.Reducer.max(), "", True)
+                                  .combine(ee.Reducer.percentile([25, 75]), "", True),
+            geometry=aoi.geometry(),
+            scale=scale,
+            maxPixels=1e13
+        )
+
+        urban_mask, nonurban_mask = get_urban_masks(aoi, year)
+        urban_lst = image.updateMask(urban_mask)
+        nonurban_lst = image.updateMask(nonurban_mask)
+
+        urban_mean = urban_lst.reduceRegion(
+            reducer=ee.Reducer.mean(), geometry=aoi.geometry(), scale=scale, maxPixels=1e13
+        ).get("LST_Celsius")
+
+        nonurban_mean = nonurban_lst.reduceRegion(
+            reducer=ee.Reducer.mean(), geometry=aoi.geometry(), scale=scale, maxPixels=1e13
+        ).get("LST_Celsius")
+
+        result = stats.combine(ee.Dictionary({
+            "year": year,
+            "SUHII": ee.Number(urban_mean).subtract(ee.Number(nonurban_mean))
+        }))
+
+        return result
+
+    results = []
+    for y in range(start_year, end_year + 1):
+        res = compute_lst_stats(y).getInfo()
+        results.append({
+            "Year": y,
+            "Mean": round(res.get("LST_Celsius_mean", 0), 1),
+            "Median": round(res.get("LST_Celsius_median", 0), 1),
+            "Min": round(res.get("LST_Celsius_min", 0), 1),
+            "Max": round(res.get("LST_Celsius_max", 0), 1),
+            "Q1": round(res.get("LST_Celsius_p25", 0), 1),
+            "Q3": round(res.get("LST_Celsius_p75", 0), 1),
+            "SUHII": round(res.get("SUHII", 0), 2),
+        })
+
+    df = pd.DataFrame(results)
+
+    # === Heatmap for final year ===
+    final_coll = (
+        ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+        .merge(ee.ImageCollection("LANDSAT/LC09/C02/T1_L2"))
+        .filterBounds(aoi)
+        .filterDate(f"{end_year}-01-01", f"{end_year}-12-31")
+        .map(lambda img: preprocess_landsat(img.clip(aoi)))
+    )
+
+    final_lst = final_coll.max().rename("LST_Celsius").clip(aoi)
+
+    vis_stats = final_lst.reduceRegion(
+        reducer=ee.Reducer.percentile([1, 99]),
+        geometry=aoi.geometry(),
+        scale=scale,
+        maxPixels=1e13
+    ).getInfo()
+
+    min_val = vis_stats.get("LST_Celsius_p1", 30)
+    max_val = vis_stats.get("LST_Celsius_p99", 55)
+
+    heatmap = final_lst.visualize(
+        min=min_val,
+        max=max_val,
+        palette=["#0000FF", "#00FFFF", "#00FF00", "#FFFF00", "#FFA500", "#FF0000"]
+    ).clip(aoi).updateMask(final_lst.mask())
+
+    return {
+        "df": df.to_dict(orient="records"),
+        "heatmap": heatmap,
         "aoi": aoi  # You will need this for export
     }
 

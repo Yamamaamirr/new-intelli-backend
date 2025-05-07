@@ -679,11 +679,7 @@ def voronoi():
                 "tif_file": output_path
             })
 
-                # return geolulc(geojson_path or shapefile, start_date, end_date)
-
-            # except Exception as e:
-            #     logger.error("Failed to parse UHI redirection data.")
-            #     return jsonify({"error": str(e)}), 500
+             
             except Exception as e:
                 logger.error(f"Failed to parse UHI redirection data.\n{traceback.format_exc()}")
                 return jsonify({"error": str(e)}), 500
@@ -829,9 +825,7 @@ def generate_lulc_from_geojson(geojson_path: str, start_date: str, end_date: str
 
 def calculate_lst_uhi_stats(geojson_path, start_year, end_year, scale=30):
 
-    # Authenticate & initialize
-    ee.Authenticate()
-    ee.Initialize()
+   
 
     # Load GeoJSON and convert to EE object
     gdf = gpd.read_file(geojson_path)
