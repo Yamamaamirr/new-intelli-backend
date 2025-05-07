@@ -22,28 +22,17 @@ import pandas as pd
 app = Flask(__name__)
 CORS(app)  # This will enable CORS for all routes
 
-try:
-    SERVICE_ACCOUNT = 'chat2geo-sa@fydp-457907.iam.gserviceaccount.com'
-    CREDENTIALS_FILE = 'fydp-457907-66f7cef9f024.json'
-    
-    credentials = ee.ServiceAccountCredentials(SERVICE_ACCOUNT, CREDENTIALS_FILE)
-    ee.Initialize(credentials)
-    print("✅ Google Earth Engine initialized successfully.")
-except Exception as e:
-    print("❌ Failed to initialize Google Earth Engine:", e)
-
-
-
+# Database connection configuration
 DB_CONFIG = {
     'dbname': 'Geogit Intelli',
     'user': 'postgres',
-    'password': 'postgres',
+    'password': 'masood73',
     'host': 'localhost'
 }
 
 # GeoServer configuration
 GEOSERVER_CONFIG = {
-    'url': 'http://10.7.236.23:8080/geoserver',
+    'url': 'http://127.0.0.1:8080/geoserver',
     'username': 'admin',
     'password': 'geoserver',
     'workspace': 'geogit'
@@ -179,17 +168,10 @@ def upload_vector_data(project_id):
         # Get file extension
         file_extension = os.path.splitext(file.filename)[1].lower()
         
-        # Generate version ID early so we can use it for the filename
-        version_id = str(uuid.uuid4())
-        
-        # Create uploads directory if it doesn't exist
-        uploads_dir = os.path.join(app.root_path, 'uploads')
-        os.makedirs(uploads_dir, exist_ok=True)
-        
-        # Save the file with version_id as name but keep original extension
-        saved_filename = f"{version_id}{file_extension}"
-        saved_file_path = os.path.join(uploads_dir, saved_filename)
-        file.save(saved_file_path)
+        # Create a temporary directory to store the uploaded file
+        temp_dir = tempfile.mkdtemp()
+        temp_file_path = os.path.join(temp_dir, file.filename)
+        file.save(temp_file_path)
         
         # Process the file based on its type
         gdf = None
@@ -197,20 +179,20 @@ def upload_vector_data(project_id):
         
         try:
             if file_extension == '.geojson':
-                gdf = gpd.read_file(saved_file_path)
+                gdf = gpd.read_file(temp_file_path)
                 file_format = 'geojson'
             elif file_extension == '.kml':
-                gdf = gpd.read_file(saved_file_path, driver='KML')
+                gdf = gpd.read_file(temp_file_path, driver='KML')
                 file_format = 'kml'
             elif file_extension == '.shp':
-                gdf = gpd.read_file(saved_file_path)
+                gdf = gpd.read_file(temp_file_path)
                 file_format = 'shapefile'
             elif file_extension == '.zip':
-                # Extract the zip file to a subdirectory named after the version_id
-                zip_extract_path = os.path.join(uploads_dir, version_id)
+                # Extract the zip file
+                zip_extract_path = os.path.join(temp_dir, 'extracted')
                 os.makedirs(zip_extract_path, exist_ok=True)
                 
-                with zipfile.ZipFile(saved_file_path, 'r') as zip_ref:
+                with zipfile.ZipFile(temp_file_path, 'r') as zip_ref:
                     zip_ref.extractall(zip_extract_path)
                 
                 # Look for shapefile in the extracted directory
@@ -229,7 +211,8 @@ def upload_vector_data(project_id):
             else:
                 raise ValueError(f"Unsupported file format: {file_extension}")
             
-            # Create commit message
+            # Create a new version for this upload
+            version_id = str(uuid.uuid4())
             commit_message = f"Uploaded {file_format} file: {file.filename}"
             
             # Get the latest version number for this project
@@ -314,33 +297,23 @@ def upload_vector_data(project_id):
                 'version_id': version_id,
                 'version_number': version_number,
                 'features_count': len(gdf),
-                'geometry_data': geojson_data,
-                'original_filename': file.filename,
-                'saved_filename': saved_filename
+                'geometry_data': geojson_data
             }), 201
             
         except Exception as e:
             # Roll back transaction in case of error
             conn.rollback()
-            
-            # Clean up uploaded file if something went wrong
-            if os.path.exists(saved_file_path):
-                os.remove(saved_file_path)
-            
-            # Clean up extracted zip directory if it exists
-            zip_extract_path = os.path.join(uploads_dir, version_id)
-            if os.path.exists(zip_extract_path):
-                shutil.rmtree(zip_extract_path, ignore_errors=True)
-            
             raise e
         
         finally:
+            # Clean up temporary files
+            shutil.rmtree(temp_dir, ignore_errors=True)
             cursor.close()
             conn.close()
             
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-    
+
 @app.route('/api/projects/<project_id>/upload/raster', methods=['POST'])
 def upload_raster_data(project_id):
     try:
@@ -374,14 +347,14 @@ def upload_raster_data(project_id):
         
         try:
             # Generate a unique filename to avoid conflicts
-            version_id = str(uuid.uuid4())  # Generate this first
-            file_path = os.path.join(RASTER_UPLOAD_DIR, f"{version_id}.tif")
+            unique_filename = f"{uuid.uuid4()}_{file.filename}"
+            file_path = os.path.join(RASTER_UPLOAD_DIR, unique_filename)
             
             # Save the file to the upload directory
             file.save(file_path)
             
             # Create a new version for this upload
-          
+            version_id = str(uuid.uuid4())
             commit_message = f"Uploaded raster file: {file.filename}"
             
             # Get the latest version number for this project
@@ -438,11 +411,11 @@ def upload_raster_data(project_id):
                 pass
             
             # Generate a unique layer name
-            layer_name = f"raster_{version_id}"
+            layer_name = f"raster_{project_id}_{version_number}".replace('-', '_').replace('.', '_')
             
             # Upload raster to GeoServer
             geo.create_coveragestore(
-                layer_name=f"raster_{version_id}",  # Simplified layer name
+                layer_name=layer_name,
                 path=file_path,
                 workspace=GEOSERVER_CONFIG['workspace']
             )
@@ -507,7 +480,7 @@ def create_wms_url(workspace, layer_name):
     """
     Create the WMS URL for the published layer in GeoServer to get bounding box.
     """
-    wms_url = f"http://10.7.236.23:8080/geoserver/{workspace}/wms?service=WMS&request=GetCapabilities"
+    wms_url = f"http://10.7.237.121:8080/geoserver/{workspace}/wms?service=WMS&request=GetCapabilities"
     return wms_url
 
 def create_mapbox_url(workspace, store_name):
@@ -515,7 +488,7 @@ def create_mapbox_url(workspace, store_name):
     Create the Mapbox URL for the published layer in GeoServer.
     """
     mapbox_url = (
-        f"http://10.7.236.23:8080/geoserver/wms?service=WMS&request=GetMap"
+        f"http://10.7.237.121:8080/geoserver/wms?service=WMS&request=GetMap"
         f"&layers={workspace}:{store_name}&styles=&format=image/png"
         f"&transparent=true&version=1.1.1&width=256&height=256"
         f"&srs=EPSG:3857&bbox={{bbox-epsg-3857}}"
@@ -553,14 +526,12 @@ def fetch_bounding_box(wms_url, layer_name):
 @app.route('/voronoi', methods=['POST'])
 def voronoi():
     try:
-        # Check required parameters
-        if 'file_inputs' not in request.json or 'prompt' not in request.json or 'project_id' not in request.json:
-            logger.warning("Missing required parameters in request.")
-            return jsonify({"error": "Missing file_inputs, prompt, or project_id"}), 400
+        if 'prompt' not in request.form:
+            logger.warning("Missing prompt in request.")
+            return jsonify({"error": "Missing files or prompt"}), 400
 
-        project_id = request.json['project_id'] 
-        file_inputs = request.json['file_inputs']
-        prompt = request.json['prompt']        
+        files = request.files.getlist("files")
+        prompt = request.form['prompt']
         prompt += ("Task is above..."
         "Use GeoPandas, rasterio, Shapely if applicable. "
         "Don't plot. Save to file. Give Only python code. No extra text. Stay within max tries. "
@@ -575,51 +546,65 @@ def voronoi():
         "{If the task is related to downloading amenities, # Filter to only Point and ensure valid geometries, and then export to geojson, similarly filter to point, line or polygon, based on what user has asked in the task}"
         "If the task is related to downloading something from OSM, # Filter to point, line or polygon, and ensure valid geometries, based on what user has asked in the task.")
 
-        logger.debug(f"Processing request with prompt: {prompt}")
+        print(prompt)
+        logger.debug(prompt)
+        tif_path, shp_dir, geojson_path = None, None, None
 
-        # Determine file paths based on data type
+
+        for f in files:
+            filename = secure_filename(f.filename)
+            file_ext = os.path.splitext(filename)[1].lower()
+            save_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            f.save(save_path)
+            print("save_path",save_path)
+
+            logger.info(f"File uploaded: {save_path}")
+
+            if file_ext == '.zip':
+                with zipfile.ZipFile(save_path, 'r') as zip_ref:
+                    extracted_names = zip_ref.namelist()
+                    zip_ref.extractall(app.config['UPLOAD_FOLDER'])
+
+                # Find the top-level folder inside the zip, if any
+                top_dirs = {name.split('/')[0] for name in extracted_names if '/' in name}
+                if top_dirs:
+                    extracted_folder = os.path.join(app.config['UPLOAD_FOLDER'], list(top_dirs)[0])
+                else:
+                    extracted_folder = app.config['UPLOAD_FOLDER']
+                shp_dir = extracted_folder
+                logger.info(f"Extracted ZIP folder path: {shp_dir}")
+            elif file_ext == '.tif':
+                tif_path = save_path
+            elif file_ext == '.geojson':
+                geojson_path = save_path
+
         uploaded_files = {}
-        output_path = None
 
-        for idx, entry in enumerate(file_inputs):
-            fid = entry.get("id")
-            ftype = entry.get("type")
+        if shp_dir:
+            shapefile = find_file_by_ext(shp_dir, '.shp')
+            if shapefile:
+                uploaded_files["shapefile"] = shapefile
 
-            if not fid or not ftype:
-                logger.error(f"Invalid file input: {entry}")
-                return jsonify({"error": f"Each file input must have 'id' and 'type': {entry}"}), 400
+        if tif_path:
+            uploaded_files["raster"] = tif_path
 
-            if ftype == 'vector':
-                vector_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{fid}.geojson")
-                if not os.path.exists(vector_path):
-                    logger.error(f"Vector file not found: {vector_path}")
-                    return jsonify({"error": f"Vector file not found: {fid}"}), 404
-                uploaded_files[f"vector_{idx}"] = vector_path
-                logger.info(f"Using vector file: {vector_path}")
+        if geojson_path:
+            uploaded_files["geojson"] = geojson_path
 
-            elif ftype == 'raster':
-                raster_path = os.path.join(RASTER_UPLOAD_DIR, f"{fid}.tif")
-                if not os.path.exists(raster_path):
-                    logger.error(f"Raster file not found: {raster_path}")
-                    return jsonify({"error": f"Raster file not found: {fid}"}), 404
-                uploaded_files[f"raster_{idx}"] = raster_path
-                logger.info(f"Using raster file: {raster_path}")
 
-            else:
-                logger.error(f"Invalid file type: {ftype}")
-                return jsonify({"error": f"Invalid file type: {ftype}"}), 400
-        
+        if not uploaded_files:
+            logger.error("No valid .tif or .shp or .geojson found in upload.")
+            #return jsonify({"error": "No valid .tif or .shp found in upload."}), 400
+
         deepseek_result = ask_deepseek(prompt)
         full_response = deepseek_result["full_response"]
         code = deepseek_result["code"]
 
         logger.debug(full_response)
 
-        # Check for LULC case first
         if full_response and "Keyword: LULC" in full_response:
-            logger.debug('Processing LULC request')
+            logger.debug('aa')
             try:
-                # Extract dates from the response
                 start_match = re.search(r"Start_date:\s*(\d{4}-\d{2}-\d{2})", full_response)
                 end_match = re.search(r"End_date:\s*(\d{4}-\d{2}-\d{2})", full_response)
                 start_date = start_match.group(1) if start_match else None
@@ -628,195 +613,165 @@ def voronoi():
                 if not (start_date and end_date):
                     return jsonify({"error": "Start or end date missing in LULC response"}), 400
                 
-                # Determine input file (geojson or shapefile)
-                lulc_input = None
-                for _, actual_path in uploaded_files.items():
-                    if actual_path.lower().endswith(('.geojson', '.shp')):
-                        lulc_input = actual_path
-                        break
-                
+                lulc_input = geojson_path or uploaded_files.get("shapefile")
                 if not lulc_input:
                     return jsonify({"error": "GeoJSON or Shapefile required for LULC analysis"}), 400
                 
-                # Generate LULC result
                 result = generate_lulc_from_geojson(lulc_input, start_date, end_date)
 
-                # Export the result
-                output_filename = f"lulc_{start_date}_{end_date}.tif"
-                output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename).replace("\\", "/")
-                
+                output_path = os.path.join(app.config['OUTPUT_FOLDER'], 'lulc_colored.tif').replace("\\", "/")
                 geemap.ee_export_image(
-                    result["dw_rgb"],
+                result["dw_rgb"],
+                filename=output_path,
+                region=result["aoi"].geometry(),
+                scale=10,
+                crs="EPSG:4326",
+                file_per_band=False
+                )
+
+                return jsonify({
+                "message": "LULC analysis complete",
+                "label_percentages": result["label_percentages"],
+                "tif_file": output_path
+            })
+
+                # return geolulc(geojson_path or shapefile, start_date, end_date)
+
+            except Exception as e:
+                logger.error("Failed to parse LULC redirection data.")
+                return jsonify({"error": str(e)}), 500
+            
+        if full_response and "Keyword: UHI" in full_response:
+            logger.debug('uhi')
+            try:
+                start_match = re.search(r"Start_date:\s*(\d{4})", full_response)
+                end_match = re.search(r"End_date:\s*(\d{4})", full_response)
+                start_date = start_match.group(1) if start_match else None
+                end_date = end_match.group(1) if end_match else None
+                start_date = int(start_date[:4])
+                end_date = int(end_date[:4])
+
+                if not (start_date and end_date):
+                    return jsonify({"error": "Start or end date missing in UHI response"}), 400
+                
+                uhi_input = geojson_path or uploaded_files.get("shapefile")
+                if not uhi_input:
+                    return jsonify({"error": "GeoJSON or Shapefile required for UHI analysis"}), 400
+                
+                # result = generate_uhi_from_geojson(uhi_input, start_date, end_date)
+                result = calculate_lst_uhi_stats(geojson_path, start_date, end_date)
+
+                output_path = os.path.join(app.config['OUTPUT_FOLDER'], 'uhi_heatmap_rgb_clean.tif').replace("\\", "/")
+                # You can export later like this:
+                geemap.ee_export_image(
+                    result["heatmap"],
                     filename=output_path,
                     region=result["aoi"].geometry(),
-                    scale=10,
+                    scale=30,
                     crs="EPSG:4326",
                     file_per_band=False
                 )
 
-                # Upload the generated raster file
-                with open(output_path, 'rb') as f:
-                    files = {'file': (os.path.basename(output_path), f)}
-                    upload_response = requests.post(
-                        f"{request.host_url}api/projects/{project_id}/upload/raster",
-                        files=files
-                    )
-                
-                if upload_response.status_code != 201:
-                    logger.error(f"Failed to upload LULC raster data: {upload_response.text}")
-                    return jsonify({"error": "Failed to upload LULC raster data"}), 500
-                
-                upload_data = upload_response.json()
-                
-                # Return the response in required format
+
                 return jsonify({
-                    "id": upload_data.get('version_id'),
-                    "name": os.path.basename(output_path),
-                    "type": "raster",
-                    "format": "tif",
-                    "crs": "EPSG:4326",
-                    "status": "new",
-                    "version_number": upload_data.get('version_number'),
-                    "mapbox_url": upload_data.get('mapbox_url'),
-                    "bounding_box": upload_data.get('bounding_box'),
-                    "file_path": upload_data.get('file_path')
-                }), 200
+                "message": "UHI analysis complete",
+                "df": result["df"],
+                "tif_file": output_path
+            })
 
+                # return geolulc(geojson_path or shapefile, start_date, end_date)
+
+            # except Exception as e:
+            #     logger.error("Failed to parse UHI redirection data.")
+            #     return jsonify({"error": str(e)}), 500
             except Exception as e:
-                logger.error(f"Error during LULC processing: {str(e)}")
-                logger.error(traceback.format_exc())
+                logger.error(f"Failed to parse UHI redirection data.\n{traceback.format_exc()}")
                 return jsonify({"error": str(e)}), 500
-
 
 
         logger.info(f"Generated code: {code}")
         if not code:
             logger.error("Code generation failed.")
             return jsonify({"error": "Code generation failed."}), 500
-        
-        try:
-            tif_matches = re.findall(r'["\']([^"\']+\.tif)["\']', code, re.IGNORECASE)
-            shp_matches = re.findall(r'["\']([^"\']+\.shp)["\']', code, re.IGNORECASE)
-            geojson_matches = re.findall(r'["\']([^"\']+\.geojson)["\']', code, re.IGNORECASE)
-            output_matches = re.findall(r'["\']([^"\']+\.(?:shp|tif|geojson|csv))["\']', code, re.IGNORECASE)
+        output_basename = None
+        output_base_ext = None
+        if code:
+            try:
+                tif_matches = re.findall(r'["\']([^"\']+\.tif)["\']', code, re.IGNORECASE)
+                shp_matches = re.findall(r'["\']([^"\']+\.shp)["\']', code, re.IGNORECASE)
+                geojson_matches = re.findall(r'["\']([^"\']+\.geojson)["\']', code, re.IGNORECASE)
+                output_matches = re.findall(r'["\']([^"\']+\.(?:shp|tif|geojson|csv))["\']', code, re.IGNORECASE)
 
-            for match in tif_matches:
-                for _, actual_path in uploaded_files.items():
-                    if actual_path.lower().endswith('.tif'):
-                        safe_path = actual_path.replace("\\", "/")
-                        code = code.replace(match, safe_path)
+                logger.debug(f"Found .tif references in code: {tif_matches}")
+                logger.debug(f"Found .shp references in code: {shp_matches}")
+                logger.debug(f"Found .geojson references in code: {geojson_matches}")
+                logger.debug(f"Found output references in code: {output_matches}")
 
-            for match in shp_matches:
-                for _, actual_path in uploaded_files.items():
-                    if actual_path.lower().endswith('.shp'):
-                        for line in code.splitlines():
-                            if match in line and 'read_file' in line:
-                                safe_path = actual_path.replace("\\", "/")
-                                code = code.replace(match, safe_path)
-
-            for match in geojson_matches:
-                for _, actual_path in uploaded_files.items():
-                    if actual_path.lower().endswith('.geojson'):
-                        for line in code.splitlines():
-                            if match in line and 'read_file' in line:
-                                safe_path = actual_path.replace("\\", "/")
-                                code = code.replace(match, safe_path)
-
-            output_basename = None
-            output_base_ext = None
-            output_path = None
-            for match in output_matches:
-                for line in code.splitlines():
-                    if match in line and 'to_file' in line:
-                        if any(ext in match.lower() for ext in [".shp", ".geojson"]):
-                            output_basename = os.path.splitext(os.path.basename(match))[0]
-                            output_base_ext = os.path.splitext(os.path.basename(match))[1].lower()
-                            output_path = os.path.join(app.config['OUTPUT_FOLDER'], os.path.basename(match))
-                            safe_path = output_path.replace("\\", "/")
+                for match in tif_matches:
+                    for _, actual_path in uploaded_files.items():
+                        if actual_path.lower().endswith('.tif'):
+                            safe_path = actual_path.replace("\\", "/")
                             code = code.replace(match, safe_path)
 
-            logger.debug(code)
-            exec_globals = {"gpd": gpd, "rasterio": rasterio}
-            exec(code, exec_globals)
-            logger.info("Geospatial code executed successfully.")
+                for match in shp_matches:
+                    for _, actual_path in uploaded_files.items():
+                        if actual_path.lower().endswith('.shp'):
+                            for line in code.splitlines():
+                                if match in line and 'read_file' in line:
+                                    safe_path = actual_path.replace("\\", "/")
+                                    code = code.replace(match, safe_path)
+
+                for match in geojson_matches:
+                    for _, actual_path in uploaded_files.items():
+                        if actual_path.lower().endswith('.geojson'):
+                            for line in code.splitlines():
+                                if match in line and 'read_file' in line:
+                                    safe_path = actual_path.replace("\\", "/")
+                                    code = code.replace(match, safe_path)
+
+                for match in output_matches:
+                    for line in code.splitlines():
+                        if match in line and 'to_file' in line:
+                            if any(ext in match.lower() for ext in [".shp", ".geojson"]):
+                                output_basename = os.path.splitext(os.path.basename(match))[0]
+                                output_base_ext = os.path.splitext(os.path.basename(match))[1].lower()
+                                output_path = os.path.join(app.config['OUTPUT_FOLDER'], os.path.basename(match))
+                                safe_path = output_path.replace("\\", "/")
+                                code = code.replace(match, safe_path)
+
+                logger.debug(code)
+                exec_globals = {"gpd": gpd, "rasterio": rasterio}
+                exec(code, exec_globals)
+                logger.info("Geospatial code executed successfully.")
+            except Exception as e:
+                logger.error(f"Error during geospatial code execution: {str(e)}")
+                logger.error(traceback.format_exc())
+                return jsonify({"error": str(e)}), 500
             
-          
+            output_folder = app.config['OUTPUT_FOLDER']
+            if output_base_ext == '.geojson':
+                output_geojson_file = os.path.join(output_folder, output_basename + '.geojson')
+                if os.path.exists(output_geojson_file):
+                    return send_file(output_geojson_file, as_attachment=True)
+                else:
+                    return jsonify({"error": "GeoJSON output file not found."}), 404
 
-            # Check if output file was created
-            if not output_path or not os.path.exists(output_path):
-                logger.error("Output file not generated")
-                return jsonify({"error": "Output file not generated"}), 500
-                
-            # Determine if this is a vector or raster output
-            if output_path.lower().endswith(('.tif', '.tiff')):
-                # Upload the generated file to the project as raster
-                with open(output_path, 'rb') as f:
-                    files = {'file': (os.path.basename(output_path), f)}
-                    upload_response = requests.post(
-                        f"{request.host_url}api/projects/{project_id}/upload/raster",
-                        files=files
-                    )
-                
-                if upload_response.status_code != 201:
-                    logger.error(f"Failed to upload raster data: {upload_response.text}")
-                    return jsonify({"error": "Failed to upload raster data"}), 500
-                
-                upload_data = upload_response.json()
-                
-                return jsonify({
-                    "id": upload_data.get('version_id'),
-                    "name": os.path.basename(output_path),
-                    "type": "raster",
-                    "format": output_base_ext[1:],  # "tif" or "tiff"
-                    "crs": "EPSG:4326",
-                    "status": "new",
-                    "version_number": upload_data.get('version_number'),
-                    "mapbox_url": upload_data.get('mapbox_url'),
-                    "bounding_box": upload_data.get('bounding_box'),
-                    "file_path": upload_data.get('file_path')
-                }), 200
-            else:
-                # This is the existing vector data handling (geojson/shp)
-                with open(output_path, 'rb') as f:
-                    files = {'file': (os.path.basename(output_path), f)}
-                    upload_response = requests.post(
-                        f"{request.host_url}api/projects/{project_id}/upload/vector",
-                        files=files
-                    )
-                
-                if upload_response.status_code != 201:
-                    logger.error(f"Failed to upload vector data: {upload_response.text}")
-                    return jsonify({"error": "Failed to upload vector data"}), 500
-                
-                upload_data = upload_response.json()
-                
-                # Read the output file to get geometry data
-                gdf = gpd.read_file(output_path)
-                geojson_data = json.loads(gdf.to_json())
-                
-                return jsonify({
-                    "id": upload_data.get('version_id'),
-                    "name": os.path.basename(output_path),
-                    "type": "vector",
-                    "format": output_base_ext[1:],  # "geojson" or "shp"
-                    "crs": "EPSG:4326",
-                    "status": "new",
-                    "version_number": upload_data.get('version_number'),
-                    "geometry_data": geojson_data,
-                    "features_count": len(gdf)
-                }), 200
+            elif output_base_ext == '.shp':
+                zip_output_path = os.path.join(output_folder, output_basename + '.zip')
+                with zipfile.ZipFile(zip_output_path, 'w') as zipf:
+                    for ext in ['.shp', '.shx', '.dbf', '.prj', '.cpg']:
+                        filepath = os.path.join(output_folder, output_basename + ext)
+                        if os.path.exists(filepath):
+                            zipf.write(filepath, os.path.basename(filepath))
+                return send_file(zip_output_path, as_attachment=True)
 
-        except Exception as e:
-            logger.error(f"Error during geospatial code execution: {str(e)}")
-            logger.error(traceback.format_exc())
-            return jsonify({"error": str(e)}), 500
+        # else:
+        #     return jsonify({"error": "Unsupported output file type."}), 400
 
     except Exception as e:
         logger.exception("Processing failed.")
         return jsonify({"error": str(e)}), 500
     
-
-
 def generate_lulc_from_geojson(geojson_path: str, start_date: str, end_date: str):
     import ee, geemap
 
@@ -872,7 +827,134 @@ def generate_lulc_from_geojson(geojson_path: str, start_date: str, end_date: str
     }
 
 
+def calculate_lst_uhi_stats(geojson_path, start_year, end_year, scale=30):
 
-    
+    # Authenticate & initialize
+    ee.Authenticate()
+    ee.Initialize()
+
+    # Load GeoJSON and convert to EE object
+    gdf = gpd.read_file(geojson_path)
+    geojson = gdf.__geo_interface__
+    aoi = geemap.geojson_to_ee(geojson)
+
+    # Preprocess Landsat
+    def preprocess_landsat(img):
+        thermal = img.select("ST_B10").multiply(0.00341802).add(149.0).subtract(273.15).rename("LST_Celsius")
+        cloud_mask = (
+            img.select("QA_PIXEL").bitwiseAnd(1 << 3)
+            .Or(img.select("QA_PIXEL").bitwiseAnd(1 << 1))
+            .Or(img.select("QA_PIXEL").bitwiseAnd(1 << 4))
+            .eq(0)
+        )
+        return thermal.updateMask(cloud_mask).copyProperties(img, ["system:time_start"])
+
+    def get_urban_masks(geometry, year):
+        dw = (
+            ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1")
+            .filterBounds(geometry)
+            .filterDate(f"{end_year}-01-01", f"{end_year}-12-31")
+            .select("label")
+            .mode()
+            .clip(geometry)
+        )
+        urban = dw.eq(6)
+        nonurban = dw.neq(6)
+        return urban, nonurban
+
+    def compute_lst_stats(year):
+        start = ee.Date.fromYMD(year, 6, 1)
+        end = ee.Date.fromYMD(year, 8, 31)
+
+        coll = (
+            ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+            .merge(ee.ImageCollection("LANDSAT/LC09/C02/T1_L2"))
+            .filterBounds(aoi)
+            .filterDate(start, end)
+            .map(lambda img: preprocess_landsat(img.clip(aoi)))
+        )
+
+        image = coll.reduce(ee.Reducer.mean()).rename("LST_Celsius")
+
+        stats = image.reduceRegion(
+            reducer=ee.Reducer.mean().combine(ee.Reducer.median(), "", True)
+                                  .combine(ee.Reducer.min(), "", True)
+                                  .combine(ee.Reducer.max(), "", True)
+                                  .combine(ee.Reducer.percentile([25, 75]), "", True),
+            geometry=aoi.geometry(),
+            scale=scale,
+            maxPixels=1e13
+        )
+
+        urban_mask, nonurban_mask = get_urban_masks(aoi, year)
+        urban_lst = image.updateMask(urban_mask)
+        nonurban_lst = image.updateMask(nonurban_mask)
+
+        urban_mean = urban_lst.reduceRegion(
+            reducer=ee.Reducer.mean(), geometry=aoi.geometry(), scale=scale, maxPixels=1e13
+        ).get("LST_Celsius")
+
+        nonurban_mean = nonurban_lst.reduceRegion(
+            reducer=ee.Reducer.mean(), geometry=aoi.geometry(), scale=scale, maxPixels=1e13
+        ).get("LST_Celsius")
+
+        result = stats.combine(ee.Dictionary({
+            "year": year,
+            "SUHII": ee.Number(urban_mean).subtract(ee.Number(nonurban_mean))
+        }))
+
+        return result
+
+    results = []
+    for y in range(start_year, end_year + 1):
+        res = compute_lst_stats(y).getInfo()
+        results.append({
+            "Year": y,
+            "Mean": round(res.get("LST_Celsius_mean", 0), 1),
+            "Median": round(res.get("LST_Celsius_median", 0), 1),
+            "Min": round(res.get("LST_Celsius_min", 0), 1),
+            "Max": round(res.get("LST_Celsius_max", 0), 1),
+            "Q1": round(res.get("LST_Celsius_p25", 0), 1),
+            "Q3": round(res.get("LST_Celsius_p75", 0), 1),
+            "SUHII": round(res.get("SUHII", 0), 2),
+        })
+
+    df = pd.DataFrame(results)
+
+    # === Heatmap for final year ===
+    final_coll = (
+        ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+        .merge(ee.ImageCollection("LANDSAT/LC09/C02/T1_L2"))
+        .filterBounds(aoi)
+        .filterDate(f"{end_year}-01-01", f"{end_year}-12-31")
+        .map(lambda img: preprocess_landsat(img.clip(aoi)))
+    )
+
+    final_lst = final_coll.max().rename("LST_Celsius").clip(aoi)
+
+    vis_stats = final_lst.reduceRegion(
+        reducer=ee.Reducer.percentile([1, 99]),
+        geometry=aoi.geometry(),
+        scale=scale,
+        maxPixels=1e13
+    ).getInfo()
+
+    min_val = vis_stats.get("LST_Celsius_p1", 30)
+    max_val = vis_stats.get("LST_Celsius_p99", 55)
+
+    heatmap = final_lst.visualize(
+        min=min_val,
+        max=max_val,
+        palette=["#0000FF", "#00FFFF", "#00FF00", "#FFFF00", "#FFA500", "#FF0000"]
+    ).clip(aoi).updateMask(final_lst.mask())
+
+    return {
+        "df": df.to_dict(orient="records"),
+        "heatmap": heatmap,
+        "aoi": aoi  # You will need this for export
+    }
+
+
+
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
