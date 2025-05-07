@@ -641,40 +641,71 @@ def voronoi():
             exec(code, exec_globals)
             logger.info("Geospatial code executed successfully.")
             
-            # Check if output file was create
+          
+
+            # Check if output file was created
             if not output_path or not os.path.exists(output_path):
                 logger.error("Output file not generated")
                 return jsonify({"error": "Output file not generated"}), 500
                 
-            # Upload the generated file to the project
-            with open(output_path, 'rb') as f:
-                files = {'file': (os.path.basename(output_path), f)}
-                upload_response = requests.post(
-                    f"{request.host_url}api/projects/{project_id}/upload/vector",
-                    files=files
-                )
-            
-            if upload_response.status_code != 201:
-                logger.error(f"Failed to upload vector data: {upload_response.text}")
-                return jsonify({"error": "Failed to upload vector data"}), 500
+            # Determine if this is a vector or raster output
+            if output_path.lower().endswith(('.tif', '.tiff')):
+                # Upload the generated file to the project as raster
+                with open(output_path, 'rb') as f:
+                    files = {'file': (os.path.basename(output_path), f)}
+                    upload_response = requests.post(
+                        f"{request.host_url}api/projects/{project_id}/upload/raster",
+                        files=files
+                    )
                 
-            upload_data = upload_response.json()
-            
-            # Read the output file to get geometry data
-            gdf = gpd.read_file(output_path)
-            geojson_data = json.loads(gdf.to_json())
-            
-            return jsonify({
-                "id": upload_data.get('version_id'),
-                "name": os.path.basename(output_path),
-                "type": "vector",
-                "format": output_base_ext[1:],  # "geojson" or "shp"
-                "crs": "EPSG:4326",
-                "status": "new",
-                "version_number": upload_data.get('version_number'),
-                "geometry_data": geojson_data,
-                "features_count": len(gdf)
-            }), 200
+                if upload_response.status_code != 201:
+                    logger.error(f"Failed to upload raster data: {upload_response.text}")
+                    return jsonify({"error": "Failed to upload raster data"}), 500
+                
+                upload_data = upload_response.json()
+                
+                return jsonify({
+                    "id": upload_data.get('version_id'),
+                    "name": os.path.basename(output_path),
+                    "type": "raster",
+                    "format": output_base_ext[1:],  # "tif" or "tiff"
+                    "crs": "EPSG:4326",
+                    "status": "new",
+                    "version_number": upload_data.get('version_number'),
+                    "mapbox_url": upload_data.get('mapbox_url'),
+                    "bounding_box": upload_data.get('bounding_box'),
+                    "file_path": upload_data.get('file_path')
+                }), 200
+            else:
+                # This is the existing vector data handling (geojson/shp)
+                with open(output_path, 'rb') as f:
+                    files = {'file': (os.path.basename(output_path), f)}
+                    upload_response = requests.post(
+                        f"{request.host_url}api/projects/{project_id}/upload/vector",
+                        files=files
+                    )
+                
+                if upload_response.status_code != 201:
+                    logger.error(f"Failed to upload vector data: {upload_response.text}")
+                    return jsonify({"error": "Failed to upload vector data"}), 500
+                
+                upload_data = upload_response.json()
+                
+                # Read the output file to get geometry data
+                gdf = gpd.read_file(output_path)
+                geojson_data = json.loads(gdf.to_json())
+                
+                return jsonify({
+                    "id": upload_data.get('version_id'),
+                    "name": os.path.basename(output_path),
+                    "type": "vector",
+                    "format": output_base_ext[1:],  # "geojson" or "shp"
+                    "crs": "EPSG:4326",
+                    "status": "new",
+                    "version_number": upload_data.get('version_number'),
+                    "geometry_data": geojson_data,
+                    "features_count": len(gdf)
+                }), 200
 
         except Exception as e:
             logger.error(f"Error during geospatial code execution: {str(e)}")
