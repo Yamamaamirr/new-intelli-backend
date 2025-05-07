@@ -23,8 +23,7 @@ app = Flask(__name__)
 CORS(app)  # This will enable CORS for all routes
 
 try:
-    SERVICE_ACCOUNT = 'chat2geo-sa@fydp-457907.iam.gserviceaccount.com'
-    CREDENTIALS_FILE = 'fydp-457907-66f7cef9f024.json'
+   
     
     credentials = ee.ServiceAccountCredentials(SERVICE_ACCOUNT, CREDENTIALS_FILE)
     ee.Initialize(credentials)
