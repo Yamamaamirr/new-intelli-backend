@@ -18,17 +18,16 @@ import xml.etree.ElementTree as ET
 app = Flask(__name__)
 CORS(app)  # This will enable CORS for all routes
 
-# Database connection configuration
 DB_CONFIG = {
     'dbname': 'Geogit Intelli',
     'user': 'postgres',
-    'password': 'masood73',
+    'password': 'postgres',
     'host': 'localhost'
 }
 
 # GeoServer configuration
 GEOSERVER_CONFIG = {
-    'url': 'http://127.0.0.1:8080/geoserver',
+    'url': 'http://10.7.236.23:8080/geoserver',
     'username': 'admin',
     'password': 'geoserver',
     'workspace': 'geogit'
@@ -163,10 +162,17 @@ def upload_vector_data(project_id):
         # Get file extension
         file_extension = os.path.splitext(file.filename)[1].lower()
         
-        # Create a temporary directory to store the uploaded file
-        temp_dir = tempfile.mkdtemp()
-        temp_file_path = os.path.join(temp_dir, file.filename)
-        file.save(temp_file_path)
+        # Generate version ID early so we can use it for the filename
+        version_id = str(uuid.uuid4())
+        
+        # Create uploads directory if it doesn't exist
+        uploads_dir = os.path.join(app.root_path, 'uploads')
+        os.makedirs(uploads_dir, exist_ok=True)
+        
+        # Save the file with version_id as name but keep original extension
+        saved_filename = f"{version_id}{file_extension}"
+        saved_file_path = os.path.join(uploads_dir, saved_filename)
+        file.save(saved_file_path)
         
         # Process the file based on its type
         gdf = None
@@ -174,20 +180,20 @@ def upload_vector_data(project_id):
         
         try:
             if file_extension == '.geojson':
-                gdf = gpd.read_file(temp_file_path)
+                gdf = gpd.read_file(saved_file_path)
                 file_format = 'geojson'
             elif file_extension == '.kml':
-                gdf = gpd.read_file(temp_file_path, driver='KML')
+                gdf = gpd.read_file(saved_file_path, driver='KML')
                 file_format = 'kml'
             elif file_extension == '.shp':
-                gdf = gpd.read_file(temp_file_path)
+                gdf = gpd.read_file(saved_file_path)
                 file_format = 'shapefile'
             elif file_extension == '.zip':
-                # Extract the zip file
-                zip_extract_path = os.path.join(temp_dir, 'extracted')
+                # Extract the zip file to a subdirectory named after the version_id
+                zip_extract_path = os.path.join(uploads_dir, version_id)
                 os.makedirs(zip_extract_path, exist_ok=True)
                 
-                with zipfile.ZipFile(temp_file_path, 'r') as zip_ref:
+                with zipfile.ZipFile(saved_file_path, 'r') as zip_ref:
                     zip_ref.extractall(zip_extract_path)
                 
                 # Look for shapefile in the extracted directory
@@ -206,8 +212,7 @@ def upload_vector_data(project_id):
             else:
                 raise ValueError(f"Unsupported file format: {file_extension}")
             
-            # Create a new version for this upload
-            version_id = str(uuid.uuid4())
+            # Create commit message
             commit_message = f"Uploaded {file_format} file: {file.filename}"
             
             # Get the latest version number for this project
@@ -292,23 +297,33 @@ def upload_vector_data(project_id):
                 'version_id': version_id,
                 'version_number': version_number,
                 'features_count': len(gdf),
-                'geometry_data': geojson_data
+                'geometry_data': geojson_data,
+                'original_filename': file.filename,
+                'saved_filename': saved_filename
             }), 201
             
         except Exception as e:
             # Roll back transaction in case of error
             conn.rollback()
+            
+            # Clean up uploaded file if something went wrong
+            if os.path.exists(saved_file_path):
+                os.remove(saved_file_path)
+            
+            # Clean up extracted zip directory if it exists
+            zip_extract_path = os.path.join(uploads_dir, version_id)
+            if os.path.exists(zip_extract_path):
+                shutil.rmtree(zip_extract_path, ignore_errors=True)
+            
             raise e
         
         finally:
-            # Clean up temporary files
-            shutil.rmtree(temp_dir, ignore_errors=True)
             cursor.close()
             conn.close()
             
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
+    
 @app.route('/api/projects/<project_id>/upload/raster', methods=['POST'])
 def upload_raster_data(project_id):
     try:
@@ -342,14 +357,14 @@ def upload_raster_data(project_id):
         
         try:
             # Generate a unique filename to avoid conflicts
-            unique_filename = f"{uuid.uuid4()}_{file.filename}"
-            file_path = os.path.join(RASTER_UPLOAD_DIR, unique_filename)
+            version_id = str(uuid.uuid4())  # Generate this first
+            file_path = os.path.join(RASTER_UPLOAD_DIR, f"{version_id}.tif")
             
             # Save the file to the upload directory
             file.save(file_path)
             
             # Create a new version for this upload
-            version_id = str(uuid.uuid4())
+          
             commit_message = f"Uploaded raster file: {file.filename}"
             
             # Get the latest version number for this project
@@ -406,11 +421,11 @@ def upload_raster_data(project_id):
                 pass
             
             # Generate a unique layer name
-            layer_name = f"raster_{project_id}_{version_number}".replace('-', '_').replace('.', '_')
+            layer_name = f"raster_{version_id}"
             
             # Upload raster to GeoServer
             geo.create_coveragestore(
-                layer_name=layer_name,
+                layer_name=f"raster_{version_id}",  # Simplified layer name
                 path=file_path,
                 workspace=GEOSERVER_CONFIG['workspace']
             )
@@ -475,7 +490,7 @@ def create_wms_url(workspace, layer_name):
     """
     Create the WMS URL for the published layer in GeoServer to get bounding box.
     """
-    wms_url = f"http://10.7.237.121:8080/geoserver/{workspace}/wms?service=WMS&request=GetCapabilities"
+    wms_url = f"http://10.7.236.23:8080/geoserver/{workspace}/wms?service=WMS&request=GetCapabilities"
     return wms_url
 
 def create_mapbox_url(workspace, store_name):
@@ -483,7 +498,7 @@ def create_mapbox_url(workspace, store_name):
     Create the Mapbox URL for the published layer in GeoServer.
     """
     mapbox_url = (
-        f"http://10.7.237.121:8080/geoserver/wms?service=WMS&request=GetMap"
+        f"http://10.7.236.23:8080/geoserver/wms?service=WMS&request=GetMap"
         f"&layers={workspace}:{store_name}&styles=&format=image/png"
         f"&transparent=true&version=1.1.1&width=256&height=256"
         f"&srs=EPSG:3857&bbox={{bbox-epsg-3857}}"
@@ -521,74 +536,59 @@ def fetch_bounding_box(wms_url, layer_name):
 @app.route('/voronoi', methods=['POST'])
 def voronoi():
     try:
-        if 'prompt' not in request.form:
-            logger.warning("Missing prompt in request.")
-            return jsonify({"error": "Missing files or prompt"}), 400
+        # Check required parameters
+        if 'file_inputs' not in request.json or 'prompt' not in request.json or 'project_id' not in request.json:
+            logger.warning("Missing required parameters in request.")
+            return jsonify({"error": "Missing file_inputs, prompt, or project_id"}), 400
 
-        files = request.files.getlist("files")
-        prompt = request.form['prompt']
+        project_id = request.json['project_id'] 
+        file_inputs = request.json['file_inputs']
+        prompt = request.json['prompt']        
         prompt += ("Use GeoPandas, rasterio, Shapely if applicable. "
-        "Don't plot. Save to file. Give Only python code. No extra text. Stay within max tries. "
-        "{If the task above is about clipping then 'Clip to the actual shape of the raster's valid data (i.e., mask out areas where the raster has no data, not just the bounding box)', use this approach with rasterio.open('') as src: raster_crs = src.crs mask_data = src.dataset_mask() shapes = shapes(mask_data, transform=src.transform)  geom = [Polygon(shape[0]['coordinates'][0]) for shape in shapes if shape[1] == 255][0],  gdf_voronoi = gpd.read_file('') gdf_voronoi_clipped = gdf_voronoi[gdf_voronoi.intersects(geom)].copy() gdf_voronoi_clipped['geometry'] = gdf_voronoi_clipped.intersection(geom) gdf_voronoi_clipped.crs = raster_crs}. "
-        "{ If the task above is about generating voronoi map, 'use voronoi_polygons = voronoi_diagram(points)', Beware of this error: TypeError: 'Polygon' object is not iterable "
-        "{If the task above is about calculating the total population within each polygon using the raster values,for those polygons who have null in their population column after the population is computed, add random values between 100 to 1000 in population column for those}"
-        "{If the task is related to buffer, make sure to avoid this error:  Geometry is in a geographic CRS. Results from 'buffer' are likely incorrect. Use 'GeoSeries.to_crs()' to re-project geometries to a projected CRS before this operation.}"
-        "{If the task is to get data from OSM, use 'features_from_place' instead of 'geometries_from_place', and make sure data downloaded is saved in geojson}"
-        "{If the task is related to downloading building footprints from OSM, # Filter to only polygons and ensure valid geometries, and then export to geojson}"
-        "{If the task is related to downloading amenities, # Filter to only Point and ensure valid geometries, and then export to geojson, similarly filter to point, line or polygon, based on what user has asked in the task}"
-        "If the task is related to downloading something from OSM, # Filter to point, line or polygon, and ensure valid geometries, based on what user has asked in the task.")
+            "Don't plot. Save to file. Give Only python code. No extra text. Stay within max tries. "
+            "{If the task above is about clipping then 'Clip to the actual shape of the raster's valid data (i.e., mask out areas where the raster has no data, not just the bounding box)', use this approach with rasterio.open('') as src: raster_crs = src.crs mask_data = src.dataset_mask() shapes = shapes(mask_data, transform=src.transform)  geom = [Polygon(shape[0]['coordinates'][0]) for shape in shapes if shape[1] == 255][0],  gdf_voronoi = gpd.read_file('') gdf_voronoi_clipped = gdf_voronoi[gdf_voronoi.intersects(geom)].copy() gdf_voronoi_clipped['geometry'] = gdf_voronoi_clipped.intersection(geom) gdf_voronoi_clipped.crs = raster_crs}. "
+            "{ If the task above is about generating voronoi map, 'use voronoi_polygons = voronoi_diagram(points)', Beware of this error: TypeError: 'Polygon' object is not iterable "
+            "{If the task above is about calculating the total population within each polygon using the raster values,for those polygons who have null in their population column after the population is computed, add random values between 100 to 1000 in population column for those}"
+            "{If the task is related to buffer, make sure to avoid this error:  Geometry is in a geographic CRS. Results from 'buffer' are likely incorrect. Use 'GeoSeries.to_crs()' to re-project geometries to a projected CRS before this operation.}"
+            "{If the task is to get data from OSM, use 'features_from_place' instead of 'geometries_from_place', and make sure data downloaded is saved in geojson}"
+            "{If the task is related to downloading building footprints from OSM, # Filter to only polygons and ensure valid geometries, and then export to geojson}"
+            "{If the task is related to downloading amenities, # Filter to only Point and ensure valid geometries, and then export to geojson, similarly filter to point, line or polygon, based on what user has asked in the task}"
+            "If the task is related to downloading something from OSM, # Filter to point, line or polygon, and ensure valid geometries, based on what user has asked in the task.")
 
-        print(prompt)
-        logger.debug(prompt)
-        tif_path, shp_dir, geojson_path = None, None, None
-        
+        logger.debug(f"Processing request with prompt: {prompt}")
 
-        for f in files:
-            filename = secure_filename(f.filename)
-            file_ext = os.path.splitext(filename)[1].lower()
-            save_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            f.save(save_path)
-            print("save_path",save_path)
-
-            logger.info(f"File uploaded: {save_path}")
-
-            if file_ext == '.zip':
-                with zipfile.ZipFile(save_path, 'r') as zip_ref:
-                    extracted_names = zip_ref.namelist()
-                    zip_ref.extractall(app.config['UPLOAD_FOLDER'])
-
-                # Find the top-level folder inside the zip, if any
-                top_dirs = {name.split('/')[0] for name in extracted_names if '/' in name}
-                if top_dirs:
-                    extracted_folder = os.path.join(app.config['UPLOAD_FOLDER'], list(top_dirs)[0])
-                else:
-                    extracted_folder = app.config['UPLOAD_FOLDER']
-                
-                shp_dir = extracted_folder
-                logger.info(f"Extracted ZIP folder path: {shp_dir}")
-            elif file_ext == '.tif':
-                tif_path = save_path
-            elif file_ext == '.geojson':
-                geojson_path = save_path
-
+        # Determine file paths based on data type
         uploaded_files = {}
+        output_path = None
 
-        if shp_dir:
-            shapefile = find_file_by_ext(shp_dir, '.shp')
-            if shapefile:
-                uploaded_files["shapefile"] = shapefile
+        for idx, entry in enumerate(file_inputs):
+            fid = entry.get("id")
+            ftype = entry.get("type")
 
-        if tif_path:
-            uploaded_files["raster"] = tif_path
+            if not fid or not ftype:
+                logger.error(f"Invalid file input: {entry}")
+                return jsonify({"error": f"Each file input must have 'id' and 'type': {entry}"}), 400
 
-        if geojson_path:
-            uploaded_files["geojson"] = geojson_path
+            if ftype == 'vector':
+                vector_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{fid}.geojson")
+                if not os.path.exists(vector_path):
+                    logger.error(f"Vector file not found: {vector_path}")
+                    return jsonify({"error": f"Vector file not found: {fid}"}), 404
+                uploaded_files[f"vector_{idx}"] = vector_path
+                logger.info(f"Using vector file: {vector_path}")
 
+            elif ftype == 'raster':
+                raster_path = os.path.join(RASTER_UPLOAD_DIR, f"{fid}.tif")
+                if not os.path.exists(raster_path):
+                    logger.error(f"Raster file not found: {raster_path}")
+                    return jsonify({"error": f"Raster file not found: {fid}"}), 404
+                uploaded_files[f"raster_{idx}"] = raster_path
+                logger.info(f"Using raster file: {raster_path}")
 
-        if not uploaded_files:
-            logger.error("No valid .tif or .shp or .geojson found in upload.")
-            #return jsonify({"error": "No valid .tif or .shp found in upload."}), 400
-
+            else:
+                logger.error(f"Invalid file type: {ftype}")
+                return jsonify({"error": f"Invalid file type: {ftype}"}), 400
+        
         code = ask_deepseek(prompt)
         logger.info(f"Generated code: {code}")
         if not code:
@@ -600,11 +600,6 @@ def voronoi():
             shp_matches = re.findall(r'["\']([^"\']+\.shp)["\']', code, re.IGNORECASE)
             geojson_matches = re.findall(r'["\']([^"\']+\.geojson)["\']', code, re.IGNORECASE)
             output_matches = re.findall(r'["\']([^"\']+\.(?:shp|tif|geojson|csv))["\']', code, re.IGNORECASE)
-
-            logger.debug(f"Found .tif references in code: {tif_matches}")
-            logger.debug(f"Found .shp references in code: {shp_matches}")
-            logger.debug(f"Found .geojson references in code: {geojson_matches}")
-            logger.debug(f"Found output references in code: {output_matches}")
 
             for match in tif_matches:
                 for _, actual_path in uploaded_files.items():
@@ -630,6 +625,7 @@ def voronoi():
 
             output_basename = None
             output_base_ext = None
+            output_path = None
             for match in output_matches:
                 for line in code.splitlines():
                     if match in line and 'to_file' in line:
@@ -644,34 +640,50 @@ def voronoi():
             exec_globals = {"gpd": gpd, "rasterio": rasterio}
             exec(code, exec_globals)
             logger.info("Geospatial code executed successfully.")
+            
+            # Check if output file was create
+            if not output_path or not os.path.exists(output_path):
+                logger.error("Output file not generated")
+                return jsonify({"error": "Output file not generated"}), 500
+                
+            # Upload the generated file to the project
+            with open(output_path, 'rb') as f:
+                files = {'file': (os.path.basename(output_path), f)}
+                upload_response = requests.post(
+                    f"{request.host_url}api/projects/{project_id}/upload/vector",
+                    files=files
+                )
+            
+            if upload_response.status_code != 201:
+                logger.error(f"Failed to upload vector data: {upload_response.text}")
+                return jsonify({"error": "Failed to upload vector data"}), 500
+                
+            upload_data = upload_response.json()
+            
+            # Read the output file to get geometry data
+            gdf = gpd.read_file(output_path)
+            geojson_data = json.loads(gdf.to_json())
+            
+            return jsonify({
+                "id": upload_data.get('version_id'),
+                "name": os.path.basename(output_path),
+                "type": "vector",
+                "format": output_base_ext[1:],  # "geojson" or "shp"
+                "crs": "EPSG:4326",
+                "status": "new",
+                "version_number": upload_data.get('version_number'),
+                "geometry_data": geojson_data,
+                "features_count": len(gdf)
+            }), 200
+
         except Exception as e:
             logger.error(f"Error during geospatial code execution: {str(e)}")
             logger.error(traceback.format_exc())
             return jsonify({"error": str(e)}), 500
-        
-        output_folder = app.config['OUTPUT_FOLDER']
-        if output_base_ext == '.geojson':
-            output_geojson_file = os.path.join(output_folder, output_basename + '.geojson')
-            if os.path.exists(output_geojson_file):
-                return send_file(output_geojson_file, as_attachment=True)
-            else:
-                return jsonify({"error": "GeoJSON output file not found."}), 404
-
-        elif output_base_ext == '.shp':
-            zip_output_path = os.path.join(output_folder, output_basename + '.zip')
-            with zipfile.ZipFile(zip_output_path, 'w') as zipf:
-                for ext in ['.shp', '.shx', '.dbf', '.prj', '.cpg']:
-                    filepath = os.path.join(output_folder, output_basename + ext)
-                    if os.path.exists(filepath):
-                        zipf.write(filepath, os.path.basename(filepath))
-            return send_file(zip_output_path, as_attachment=True)
-
-        else:
-            return jsonify({"error": "Unsupported output file type."}), 400
 
     except Exception as e:
         logger.exception("Processing failed.")
         return jsonify({"error": str(e)}), 500
-
+    
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
